@@ -1,0 +1,434 @@
+# steel_agent_app.py
+"""
+Steel AI Agent - Streamlit App (Complete Prototype)
+نسخه: تولید پروتوتایپ پیشرفته
+قابلیت‌ها:
+ - ورودی اپراتور برای بچ (گرید، مواد، آنالیز)
+ - محاسبه ترکیب پیش‌بینی‌شده (وزنی)
+ - محاسبه مقدار افزودنی لازم با راندمان قابل تنظیم
+ - مشاور کوره (فرکانس / توان تقریبی بر اساس جرم)
+ - ذخیره لاگ بچ‌ها در SQLite و نمایش تاریخچه
+ - نمودار روند عناصر (matplotlib)
+ - اسکلت ماژول ML برای آینده (train / predict placeholders)
+"""
+import streamlit as st
+import pandas as pd
+import numpy as np
+import sqlite3
+import json
+import io
+import os
+from datetime import datetime
+import matplotlib.pyplot as plt
+from typing import List, Dict, Tuple
+
+# ---------- Configuration ----------
+DB_PATH = "steel_agent.db"
+st.set_page_config(page_title="Steel AI Agent", layout="wide", initial_sidebar_state="expanded")
+
+
+# ---------- Utility / Data Layer ----------
+def init_db(db_path=DB_PATH):
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS batches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_code TEXT,
+        created_at TEXT,
+        grade TEXT,
+        target_ton REAL,
+        total_mass_kg REAL,
+        materials_json TEXT,
+        predicted_comp_json TEXT,
+        target_comp_json TEXT,
+        additives_json TEXT,
+        furnace_rec_json TEXT,
+        operator_notes TEXT,
+        final_analysis_json TEXT,
+        result_quality TEXT
+    )
+    """)
+    conn.commit()
+    return conn
+
+DB_CONN = init_db()
+
+
+def save_batch_to_db(payload: dict, conn=DB_CONN):
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO batches 
+        (batch_code, created_at, grade, target_ton, total_mass_kg, materials_json, predicted_comp_json,
+         target_comp_json, additives_json, furnace_rec_json, operator_notes, final_analysis_json, result_quality)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        payload.get("batch_code"),
+        payload.get("created_at"),
+        payload.get("grade"),
+        payload.get("target_ton"),
+        payload.get("total_mass_kg"),
+        json.dumps(payload.get("materials")),
+        json.dumps(payload.get("predicted_comp")),
+        json.dumps(payload.get("target_comp")),
+        json.dumps(payload.get("additives")),
+        json.dumps(payload.get("furnace_rec")),
+        payload.get("operator_notes"),
+        json.dumps(payload.get("final_analysis")) if payload.get("final_analysis") else None,
+        payload.get("result_quality")
+    ))
+    conn.commit()
+    return cur.lastrowid
+
+
+def load_batches_df(conn=DB_CONN) -> pd.DataFrame:
+    df = pd.read_sql_query("SELECT * FROM batches ORDER BY id DESC", conn)
+    if not df.empty:
+        # expand JSON columns for convenience if needed
+        return df
+    return df
+
+
+# ---------- Calculation / Rules Engine ----------
+def weighted_composition(materials: List[Dict]) -> Tuple[Dict[str, float], float]:
+    """
+    materials: list of dicts {"name":..., "mass_kg":..., "composition": {"C":0.01, "Mn":0.5, ...}}
+    returns: (elements_predicted: {elem: fraction}, total_mass_kg)
+    """
+    total = sum(float(m.get('mass_kg', 0.0)) for m in materials)
+    if total <= 0:
+        return {}, 0.0
+    elems = {}
+    for m in materials:
+        mass = float(m.get('mass_kg', 0.0))
+        comp = m.get('composition', {})
+        for k, v in comp.items():
+            # assume composition is in fraction (e.g., 0.01 = 1%) or in percent if >2
+            val = float(v)
+            if val > 2:  # likely user supplied percent like 1.5 -> convert
+                val = val / 100.0
+            elems.setdefault(k, 0.0)
+            elems[k] += val * mass
+    for k in list(elems.keys()):
+        elems[k] = elems[k] / total  # fraction
+    return elems, total
+
+
+def compute_addition_needed(target_pct: float, pred_pct: float, total_mass_kg: float,
+                            add_elem_pct: float, efficiency: float = 0.7) -> float:
+    """
+    target_pct, pred_pct : in percent (e.g., 0.3% -> 0.3)
+    add_elem_pct : additive content in percent (e.g., MnSi has Mn=70 -> pass 70)
+    efficiency: 0-1
+    returns mass of additive in kg
+    """
+    # Convert percents to fraction
+    delta_pct = (target_pct - pred_pct)
+    if delta_pct <= 0 or total_mass_kg <= 0:
+        return 0.0
+    elem_kg_needed = (delta_pct / 100.0) * total_mass_kg
+    if add_elem_pct <= 0 or efficiency <= 0:
+        return float('inf')
+    add_mass = elem_kg_needed / ((add_elem_pct / 100.0) * efficiency)
+    return max(0.0, add_mass)
+
+
+def furnace_advisor(total_mass_kg: float) -> dict:
+    """
+    Heuristic advisor. بازگرداندن فرکانس پیشنهادی (kHz) و بازه توان تقريبی (kW)
+    مقادیر سرانگشتی — باید با ظرفیت تجهیزات کارخانه تطبیق داده شود.
+    """
+    if total_mass_kg <= 200:
+        freq = 8.0  # kHz
+        pd = 0.45  # kW per kg
+    elif total_mass_kg <= 1000:
+        freq = 3.0
+        pd = 0.35
+    else:
+        freq = 1.5
+        pd = 0.25
+    power_kw = pd * total_mass_kg
+    return {"frequency_kHz": round(freq, 2), "power_kW_est": round(power_kw, 1), "power_density_kW_per_kg": pd}
+
+
+# ---------- ML Skeleton (placeholders) ----------
+def ml_predict_quality(features: dict) -> dict:
+    """
+    اسکلت تابع پیش‌بینی کیفیت با ML.
+    فعلاً یک پیش‌بینی ساده با قواعد برمی‌گرداند.
+    در آینده: بارگذاری مدل آموزش‌دیده و پیش‌بینی با XGBoost / LightGBM.
+    """
+    # rule-based approximate: اگر انحراف کل عناصر > threshold -> risk
+    # features باید شامل pred_comp و target_comp و additives, furnace_rec باشد
+    pred = features.get("pred_comp", {})
+    targ = features.get("target_comp", {})
+    if not pred or not targ:
+        return {"fail_prob": 0.5, "reason": "insufficient_data"}
+    total_dev = 0.0
+    for el, tval in targ.items():
+        p = pred.get(el, 0.0)*100.0
+        total_dev += abs(p - (tval*100.0))
+    avg_dev = total_dev / max(1, len(targ))
+    # heuristics
+    if avg_dev <= 0.15:
+        prob = 0.05
+    elif avg_dev <= 0.5:
+        prob = 0.2
+    elif avg_dev <= 1.0:
+        prob = 0.5
+    else:
+        prob = 0.9
+    return {"fail_prob": prob, "avg_dev_pct": avg_dev, "reason": "rule_based_estimate"}
+
+
+# ---------- Streamlit UI ----------
+st.title("ایجنت هوشمند تولید شمش — نسخهٔ کاملاً کاربردی (Prototype)")
+st.markdown(
+    "این اپ یک پروتوتایپ پیشرفته است: قبل از کاربرد در خط تولید حتماً با مهندسین متالورژی و تیم برق و تجهیزات تطبیق دهید."
+)
+
+# Sidebar: تنظیمات کلی
+with st.sidebar:
+    st.header("تنظیمات کلی")
+    grade = st.selectbox("گرید", ["3SP", "5SP"])
+    target_ton = st.number_input("هدف تناژ (تن)", min_value=0.01, format="%.2f", value=1.0, step=0.1)
+    eff_mn = st.slider("راندمان جذب Mn (%)", 40, 95, 70)
+    eff_si = st.slider("راندمان جذب Si (%)", 40, 95, 75)
+    eff_c = st.slider("راندمان جذب C (%)", 50, 95, 85)
+    # default target comps (پیشفرض — قابل تنظیم در UI)
+    st.markdown("**ترکیب هدف پیش‌فرض (قابل ویرایش در فرم)**")
+    if grade == "3SP":
+        default_target = {"C": 0.16, "Mn": 0.6, "Si": 0.1}
+    else:
+        default_target = {"C": 0.32, "Mn": 0.8, "Si": 0.15}
+    st.json({k: f"{v*100:.2f} %" for k, v in default_target.items()})
+
+# Main: وارد کردن مواد
+st.subheader("ورود مواد اولیه (ورودی اپراتور)")
+st.markdown("هر ردیف یک منبع ماده است: غراضه، آهن اسفنجی (DRI/HBI)، ذوب آهن یا هر مادهٔ دیگری. مقدار و آنالیز را وارد کنید.")
+
+# session-state materials
+if 'materials' not in st.session_state:
+    st.session_state['materials'] = [
+        {"name": "DRI (HBI)", "mass_kg": 500.0, "C": 0.01, "Mn": 0.5, "Si": 0.2},
+        {"name": "Scrap", "mass_kg": 500.0, "C": 0.2, "Mn": 0.6, "Si": 0.5}
+    ]
+
+# editable table for materials
+mat_df = pd.DataFrame(st.session_state['materials'])
+# convert small fractions to percent-better display? we expect fraction (0.01 -> 1%)
+# but user may enter percent, so we allow both: show percents for easier edit
+display_df = mat_df.copy()
+for col in ['C', 'Mn', 'Si']:
+    display_df[col] = display_df[col].apply(lambda x: x*100 if x <= 3 else x)  # heuristic
+edited = st.experimental_data_editor(display_df, num_rows="dynamic", key="mat_editor")
+
+# read back to session_state and normalize to fractions
+materials = []
+for _, row in edited.iterrows():
+    comp_C = float(row.get('C', 0.0))
+    comp_Mn = float(row.get('Mn', 0.0))
+    comp_Si = float(row.get('Si', 0.0))
+    # if user entered >3 assume percent already; convert to fraction
+    if comp_C > 3:
+        comp_C = comp_C / 100.0
+    if comp_Mn > 3:
+        comp_Mn = comp_Mn / 100.0
+    if comp_Si > 3:
+        comp_Si = comp_Si / 100.0
+    materials.append({
+        "name": str(row.get('name')),
+        "mass_kg": float(row.get('mass_kg') or 0.0),
+        "composition": {"C": comp_C, "Mn": comp_Mn, "Si": comp_Si}
+    })
+st.session_state['materials'] = materials
+
+# operator notes and furnace current settings
+st.subheader("تنظیمات کوره (و یادداشت اپراتور)")
+col1, col2 = st.columns(2)
+with col1:
+    operator_notes = st.text_area("یادداشت اپراتور / منبع آنالیز", value="", placeholder="مثلاً: آنالیز لاب نشان می‌دهد C=0.18, Mn=0.55 ...")
+    current_power_kw = st.number_input("توان فعلی کوره (kW) — در صورت موجود", value=0.0, step=1.0)
+with col2:
+    current_frequency_khz = st.number_input("فرکانس فعلی کوره (kHz) — در صورت موجود", value=0.0, step=0.1)
+    # target composition inputs
+    st.markdown("### تنظیم ترکیب هدف")
+    col_t1, col_t2, col_t3 = st.columns(3)
+    with col_t1:
+        tgt_C = st.number_input("C هدف (%)", value=default_target['C']*100.0, format="%.3f", step=0.01)
+    with col_t2:
+        tgt_Mn = st.number_input("Mn هدف (%)", value=default_target['Mn']*100.0, format="%.3f", step=0.01)
+    with col_t3:
+        tgt_Si = st.number_input("Si هدف (%)", value=default_target['Si']*100.0, format="%.3f", step=0.01)
+    target_comp = {"C": tgt_C/100.0, "Mn": tgt_Mn/100.0, "Si": tgt_Si/100.0}
+
+# Additives library (example, قابل گسترش)
+ADDITIVES = {
+    "MnSi": {"Mn": 70.0, "Si": 15.0},
+    "FeSi": {"Si": 75.0},
+    "C_pure": {"C": 95.0}
+}
+
+# Button: محاسبه
+if st.button("محاسبه ترکیب و پیشنهادات"):
+    pred_comp, total_mass = weighted_composition(st.session_state['materials'])
+    st.success(f"مجموع جرم ورودی: {total_mass:.1f} kg")
+    # show predicted composition
+    st.subheader("ترکیب پیش‌بینی‌شده (وزنی)")
+    pred_display = {k: round(v*100.0, 4) for k, v in pred_comp.items()}
+    st.json(pred_display)
+
+    # compute additives required
+    additives = []
+    for el in target_comp:
+        pred_pct = pred_comp.get(el, 0.0) * 100.0
+        targ_pct = target_comp[el] * 100.0
+        if pred_pct < targ_pct - 1e-6:
+            if el == "Mn":
+                add_pct = ADDITIVES['MnSi']['Mn']
+                mass_add = compute_addition_needed(targ_pct, pred_pct, total_mass, add_pct, eff_mn/100.0)
+                additives.append({"element": "Mn", "additive": "MnSi", "add_mass_kg": round(mass_add, 3)})
+            elif el == "Si":
+                add_pct = ADDITIVES['FeSi']['Si']
+                mass_add = compute_addition_needed(targ_pct, pred_pct, total_mass, add_pct, eff_si/100.0)
+                additives.append({"element": "Si", "additive": "FeSi", "add_mass_kg": round(mass_add, 3)})
+            elif el == "C":
+                add_pct = ADDITIVES['C_pure']['C']
+                mass_add = compute_addition_needed(targ_pct, pred_pct, total_mass, add_pct, eff_c/100.0)
+                additives.append({"element": "C", "additive": "C_pure", "add_mass_kg": round(mass_add, 3)})
+
+    st.subheader("پیشنهاد افزودنی‌ها")
+    if additives:
+        st.table(pd.DataFrame(additives))
+    else:
+        st.info("ترکیب فعلی برابر یا بیشتر از ترکیب هدف است — افزودنی لازم نیست.")
+
+    # furnace recommendation
+    furnace_rec = furnace_advisor(total_mass)
+    st.subheader("توصیهٔ کوره (سرانگشتی)")
+    st.write(f"فرکانس پیشنهادی: {furnace_rec['frequency_kHz']} kHz")
+    st.write(f"توان تقریبی مورد نیاز: {furnace_rec['power_kW_est']} kW ({furnace_rec['power_density_kW_per_kg']} kW/kg)")
+
+    # ML-based quality prediction (placeholder)
+    ml_input = {"pred_comp": pred_comp, "target_comp": target_comp, "additives": additives, "furnace_rec": furnace_rec}
+    ml_out = ml_predict_quality(ml_input)
+    st.subheader("تحلیل ریسک کیفیت (تخمینی)")
+    st.write(f"احتمال عدم پاس بودن بچ (تقریبی): {ml_out.get('fail_prob')*100:.1f} %")
+    st.write(f"دلیل: {ml_out.get('reason')}, انحراف میانگین: {ml_out.get('avg_dev_pct', 'N/A'):.3f} %")
+
+    # Save to DB option
+    if st.checkbox("ذخیرهٔ پیشنها در دیتابیس (لاگ بچ)"):
+        batch_code = f"B{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        payload = {
+            "batch_code": batch_code,
+            "created_at": datetime.utcnow().isoformat(),
+            "grade": grade,
+            "target_ton": target_ton,
+            "total_mass_kg": total_mass,
+            "materials": st.session_state['materials'],
+            "predicted_comp": pred_comp,
+            "target_comp": target_comp,
+            "additives": additives,
+            "furnace_rec": furnace_rec,
+            "operator_notes": operator_notes,
+            "final_analysis": None,
+            "result_quality": None
+        }
+        rowid = save_batch_to_db(payload)
+        st.success(f"پیشنهاد در دیتابیس ذخیره شد — id: {rowid} ، batch_code: {batch_code}")
+
+# ---------- History & Dashboard ----------
+st.markdown("---")
+st.header("تاریخچهٔ بچ‌ها و تحلیل روند")
+batches_df = load_batches_df()
+if batches_df.empty:
+    st.info("هنوز هیچ بچی ذخیره نشده. پس از ذخیرهٔ پیشنهاد، اینجا لیست می‌شود.")
+else:
+    # show table of recent batches
+    st.subheader("بچ‌های ذخیره‌شده")
+    display_cols = ["id", "batch_code", "created_at", "grade", "target_ton", "total_mass_kg"]
+    st.dataframe(batches_df[display_cols].head(200))
+
+    # allow selecting a batch to see details
+    sel_id = st.number_input("مشاهده جزئیات بچ با id (از جدول بالا انتخاب کنید)", min_value=int(batches_df['id'].min()), max_value=int(batches_df['id'].max()), value=int(batches_df['id'].max()), step=1)
+    sel_row = batches_df[batches_df['id'] == sel_id]
+    if not sel_row.empty:
+        row = sel_row.iloc[0].to_dict()
+        st.subheader(f"جزئیات بچ — {row.get('batch_code')}")
+        st.write("زمان ثبت:", row.get('created_at'))
+        st.write("گرید:", row.get('grade'))
+        st.write("مجموع جرم (kg):", row.get('total_mass_kg'))
+        st.write("یادداشت اپراتور:", row.get('operator_notes'))
+        st.write("مواد ورودی:")
+        try:
+            mats = json.loads(row.get('materials_json') or "[]")
+            st.table(pd.DataFrame(mats))
+        except Exception:
+            st.write("خطا در خواندن مواد")
+        st.write("پیش‌بینی ترکیب:")
+        try:
+            pc = json.loads(row.get('predicted_comp_json') or "{}")
+            st.json({k: round(v*100.0, 4) for k, v in pc.items()})
+        except Exception:
+            st.write("—")
+        st.write("افزودنی‌ها:")
+        try:
+            adds = json.loads(row.get('additives_json') or "[]")
+            st.table(pd.DataFrame(adds))
+        except Exception:
+            st.write("—")
+        # If final analysis exists, show it
+        if row.get('final_analysis_json'):
+            fa = json.loads(row.get('final_analysis_json'))
+            st.write("آنالیز نهایی (آپلود شده):")
+            st.json({k: round(v*100.0, 4) for k, v in fa.items()})
+        else:
+            st.info("آنالیز نهایی برای این بچ آپلود نشده است.")
+
+    # Trend plots for elements across batches
+    st.subheader("نمودار روند عناصر (بر اساس آنالیز پیش‌بینی‌شده)")
+    # build a dataframe with expanded predicted comps
+    rows = []
+    for _, r in batches_df.iterrows():
+        try:
+            pc = json.loads(r['predicted_comp_json'] or "{}")
+        except:
+            pc = {}
+        base = {"id": r['id'], "batch_code": r['batch_code'], "created_at": r['created_at']}
+        for el, val in pc.items():
+            base[el] = val*100.0
+        rows.append(base)
+    trend_df = pd.DataFrame(rows).sort_values('created_at')
+    if trend_df.empty or trend_df.shape[1] <= 3:
+        st.info("دادهٔ کافی برای رسم روند وجود ندارد.")
+    else:
+        # list elements
+        elements = [c for c in trend_df.columns if c not in ['id', 'batch_code', 'created_at']]
+        chosen = st.multiselect("عنصر برای رسم روند", options=elements, default=elements[:3])
+        if chosen:
+            fig, ax = plt.subplots(figsize=(9, 4))
+            for el in chosen:
+                ax.plot(pd.to_datetime(trend_df['created_at']), trend_df[el], label=el)
+            ax.set_xlabel("زمان")
+            ax.set_ylabel("درصد عنصر (%)")
+            ax.set_title("روند عناصر پیش‌بینی‌شده در بچ‌ها")
+            ax.legend()
+            st.pyplot(fig)
+
+    # download CSV of batches
+    csv = batches_df.to_csv(index=False)
+    st.download_button("دانلود گزارش بچ‌ها (CSV)", data=csv, file_name="batches_report.csv", mime="text/csv")
+
+st.markdown("---")
+st.caption("یادآوری: مقادیر پیشنهادی فنی/توان/فرکانس بر اساس قواعد سرانگشتی‌اند — قبل از اعمال در خط تولید با مهندسین تطبیق دهید.")
+
+# ---------- Footer: next steps and dev notes ----------
+st.sidebar.markdown("---")
+st.sidebar.header("گام‌های بعدی (پیشنهاد من)")
+st.sidebar.markdown("""
+- اندازه‌گیری راندمان واقعی فروآلیاژها با بچ‌های کنترلی و ثبت آن‌ها در DB.
+- جمع‌آوری دادهٔ بیش‌تر برای آموزش مدل ML (حداقل 200 رکورد توصیه می‌شود).
+- افزودن ماژول آپلود آنالیز نهایی به‌صورت CSV و اتصال به داده‌های لابراتوار.
+- نهایی‌سازی محدوده‌های توان/فرکانس بر اساس مشخصات اینورتر/کوره کارخانه.
+- افزودن سطوح دسترسی (اپراتور/مهندس/مدیر) و قبول/تایید پیشنهادها.
+""")
